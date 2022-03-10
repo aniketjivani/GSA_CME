@@ -3,6 +3,9 @@ uuid = "19275219-254a-42b1-8709-be1a0abb06bf"
 authors = ["Aniket Jivani"]
 version = "0.1.0"
 
+[deps]
+PolyChaos = "8d666b04-775d-5f6e-b778-5ac7c70f65a3"
+
 [compat]
 julia = "1"
 
