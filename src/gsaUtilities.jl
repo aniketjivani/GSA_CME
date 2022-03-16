@@ -1,3 +1,12 @@
+using PolyChaos
+using LinearAlgebra
+using CSV
+using DelimitedFiles
+using DataFrames
+using Dates
+using ColorSchemes
+using StatsBase
+
 export processInputs,
        getInputNames,
        processMissingValues,
@@ -15,13 +24,6 @@ export processInputs,
        plotInteractionEffects,
        drawInputSamples,
        bootstrapGSA
-
-
-
-
-
-
-
 
 # function to read and process inputs
 function processInputs(inputsPath, retainedRunIdx; useBg=true)
@@ -149,37 +151,7 @@ function getSubsetIndex(multiIndex, effectIdx)
     return multiIndex[Array{Bool, 1}(subsetMI), :]
 end
 
-# # function to calculate main effects
-# function getMainEffects(coeffs, pceDegree)
-#     varF = sum(coeffs.^2)
-#     nEffects = K
-#     SIMain = []
-#     multivariateBasis = buildMultivariateBasis(nEffects, pceDegree)
-#     MI = multivariateBasis.ind
-#     for i in 1:nEffects
-#         subsetMI = getSubsetMI(MI, i)
-#         varSubset = sum(β[findall(subsetMI)].^2)
-#         push!(SIMain, varSubset / varF)
-#     end
-#     return SIMain
-# end
 
-# # function to calculate interactions
-# function getInteractionEffects(coeffs, pceDegree)
-#     varF = sum(coeffs.^2)
-#     nEffects = K
-#     SIInt = zeros(nEffects, nEffects)
-#     multivariateBasis = buildMultivariateBasis(nEffects, pceDegree)
-#     MI = multivariateBasis.ind
-#     for i in 1:nEffects - 1
-#         for j in (i + 1):nEffects
-#             subsetMI = getSubsetMI(MI, [i, j])
-#             varSubset = sum(β[findall(subsetMI)].^2)
-#             SIInt[i, j] = varSubset / varF
-#         end
-#     end
-#     return SIInt
-# end
 function performGSA(inputsPath, outputPath; gsa_kwargs...)
     # process inputs
     X = processInputs(inputsPath, retainedRunIdx; useBg=useBg)
@@ -200,6 +172,26 @@ function performGSA(inputsPath, outputPath; gsa_kwargs...)
     return gsaIndices
 end
 
+# function to calculate _only_ main effects!
+function gsaMain(β::AbstractArray; nEffects = 7, pceDegree=2, multiIndex=nothing)
+    nTimePts = size(β, 2)
+    mainEffects = zeros(nEffects, nTimePts);
+    # Diagonal elements contain main effects
+    # Off diagonal elements contain interactions
+    if isnothing(multiIndex)
+        multiIndex = buildMultivariateBasis(nEffects, pceDegree).ind
+    end
+    for t in 1:nTimePts
+        varF = sum(β[2:end, t].^2)
+        for i in 1:nEffects
+            subsetMultiIndex = getSubsetMI(multiIndex, [i, i])
+            varSubset = sum(β[findall(subsetMultiIndex), t].^2)
+            mainEffects[i, t] = varSubset / varF
+        end
+    end
+    return mainEffects
+end
+
 # function to calculate tensor of main and joint effects
 function gsa(X, Y; regularize=false, pceDegree=2)
 
@@ -213,6 +205,25 @@ function gsa(X, Y; regularize=false, pceDegree=2)
     A = buildCoefficientMatrix(X; pceDegree=pceDegree)
     β = solvePCE(A, Y; regularize=regularize)
     multiIndex = buildMultivariateBasis(nEffects, pceDegree).ind
+    for t in 1:nTimePts
+        varF = sum(β[2:end, t].^2)
+        for i in 1:nEffects
+            for j in 1:nEffects
+                subsetMultiIndex = getSubsetMI(multiIndex, [i, j])
+                varSubset = sum(β[findall(subsetMultiIndex), t].^2)
+                gsaIndices[i, j, t] = varSubset / varF
+            end
+        end
+    end
+    return gsaIndices
+end
+
+# calculate with β as input!
+function gsa(β::AbstractArray; nEffects=7, pceDegree=2)
+    @assert factorial(nEffects + pceDegree) / (factorial(nEffects) * factorial(pceDegree)) == size(β, 1)
+    nTimePts = size(β, 2)
+    multiIndex = buildMultivariateBasis(nEffects, pceDegree).ind
+    gsaIndices = zeros(nEffects, nEffects, nTimePts);
     for t in 1:nTimePts
         varF = sum(β[2:end, t].^2)
         for i in 1:nEffects
@@ -250,7 +261,9 @@ function processTimeInfo(timeData, trimIndices = (39, 141))
 end
 
 function plotMainEffects(mainEffects, timeData, inputNames;
-                        palette=palette(:tab10, rev=true))
+                        palette=palette(:tab10, rev=true),
+                        title="Title",
+                        )
     # we will first permute these so they show up with correct convention in 
     # our bar plot
 
@@ -271,11 +284,14 @@ function plotMainEffects(mainEffects, timeData, inputNames;
             xminorticks=12,
             figsize=(1000, 600),
             color=[palette[i] for i in 1:size(mainEffectsReversed, 2)]',
-            line=(0.0, :black)
+            line=(0.0, :black),
+            title=title,
+            ylims=(0, 1)
             )
     # plot!(xticks=(ticks, labels))
     plot!(xlabel = "Start Time: $(Dates.format(startTime, "dd-u-yy HH:MM:SS"))")
     plot!(ylabel = "Main Effects")
+
 end
 
 """
@@ -324,44 +340,66 @@ end
 
 # function to perform bootstrapping
 
-function drawInputSamples(inputsPath, retainedRunIdx; 
-                        useBg=true,
-                        NSamples = 100
-                        )
+# function drawInputSamples(inputsPath, retainedRunIdx; 
+#                         useBg=true,
+#                         NSamples = 100
+#                         )
     
 
 
-    return inputSamples, trainIdx
-end
+#     return inputSamples, trainIdx
+# end
 
 
 """
-Function to perform bootstrapping 
-for a given number of replicates and sample size. 
-
-The bootstrapping process is adapted from: 
-Storlie, Curtis B., et al. 
-‘Implementation and Evaluation of Nonparametric Regression 
-Procedures for Sensitivity Analysis of 
-Computationally Demanding Models’. 
-Reliability Engineering & System Safety, 
-vol. 94, no. 11, Nov. 2009, pp. 1735–63. 
-DOI.org (Crossref), https://doi.org/10.1016/j.ress.2009.05.007.
-
+Function to perform bootstrapping for a given number of replicates and sample size. 
+The bootstrapping process is given in: 
+Storlie, Curtis B., et al. Implementation and Evaluation of Nonparametric Regression Procedures for Sensitivity Analysis of Computationally 
+Demanding Models. 
+Reliability Engineering & System Safety, vol. 94, no. 11, Nov. 2009, pp. 1735–63. DOI.org (Crossref), https://doi.org/10.1016/j.ress.2009.05.007.
 """
 function bootstrapGSA(X, Y; 
-                    regularize=false, 
+                    regularize=false,
                     pceDegree=2,
                     NReplications = 1000,
-                    NSamples = 100
+                    replace=true
+                    # NSamples = 100
                     )
 
+    A = buildCoefficientMatrix(X; pceDegree=pceDegree)
+    # bootstrap sampling
+    nSamplesEnd = 100
+    nSamplesStart = 20
+    samplingRange = range(nSamplesStart, nSamplesEnd; step=10)
 
-
+    nEffects = size(X, 2)
+    nTimePts = size(Y, 2)
     
+    mainEffectsBootstrap = zeros(nEffects, nTimePts, NReplications, length(samplingRange)); 
+    multiIndex = buildMultivariateBasis(nEffects, pceDegree).ind
 
+    for replication in 1:NReplications
+        for (iSample, n) in enumerate(samplingRange)
+            println("New sample size: ", n)
+            sampleIndex = sample(1:size(X, 1), n, replace=replace)
+            ASamples = A[sampleIndex, :]
+            YSamples = Y[sampleIndex, :]
+            # A = buildCoefficientMatrix(XSamples; pceDegree=pceDegree)
+            β = solvePCE(ASamples, YSamples; regularize=regularize)
 
+            # can save some time here by extending method for supplied multiindex, and calculating multiindex outside of both our for loops.
+            mainEffectsBootstrap[:, :, replication, iSample] = gsaMain(β; nEffects=nEffects, pceDegree=pceDegree, multiIndex=multiIndex)
+        end
+    end
 
+    return mainEffectsBootstrap
+    # meanEffects = mean(mainEffectsBootstrap; dims=3)[:, :, 1, :]; # take mean across replications and squeeze out dimension
+    # stdEffects  = std(mainEffectsBootstrap; dims=3)[:, :, 1, :];  # take std across replications and squeeze out dimension
+    # return meanEffects, stdEffects
+end
 
-    return gsaSummary
+function getBootstrapSummary(bootstrapEffects)
+    meanEffects = mean(mainEffectsBootstrap; dims=3)[:, :, 1, :]; # take mean across replications and squeeze out singleton dimension
+    stdEffects = std(mainEffectsBootstrap; dims=3)[:, :, 1, :]; 
+    return meanEffects, stdEffects
 end
