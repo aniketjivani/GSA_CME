@@ -6,15 +6,20 @@ using DataFrames
 using Dates
 using ColorSchemes
 using StatsBase
+using Random
 
 export processInputs,
        getInputNames,
+       processInputsBg,
+       getInputNamesBg,
        processMissingValues,
        processOutputs,
        buildMultivariateBasis,
        buildCoefficientMatrix,
        solvePCE,
+       solveRegPCE,
        performGSA,
+       gsaMain,
        gsa,
        processMainEffects,
        getSubsetMI,
@@ -22,8 +27,11 @@ export processInputs,
        processTimeInfo,
        plotMainEffects,
        plotInteractionEffects,
-       drawInputSamples,
-       bootstrapGSA
+       bootstrapGSA,
+       getBootstrapSummary,
+       regularized_fit,
+       regularized_plot,
+       train_test_split
 
 # function to read and process inputs
 function processInputs(inputsPath, retainedRunIdx; useBg=true)
@@ -46,6 +54,29 @@ function processInputs(inputsPath, retainedRunIdx; useBg=true)
     X = Matrix(inputsFiltered[retainedRunIdx, :])
     return X
 end
+
+"""
+Function to process inputs for background solar wind runs alone.
+Assume that input file is supplied in the standardized 0-1 scaling, with following
+columns:
+BrMin, BrFactor_ADAPT, nChromoSiAWSoM, PoyntingFluxPerBSi, LperpTimesSqrtBSi,
+StochasticExponent, rMinWaveReflection
+
+"""
+function processInputsBg(inputsPath, retainedRunIdx)
+    inputRaw = CSV.read(inputsPath, DataFrame)
+    X = Matrix(inputRaw[retainedRunIdx, :])
+    return X
+end
+
+"""
+Fetch parameter names for background solar wind runs
+"""
+function getInputNamesBg(inputsPath)
+    inputRaw = CSV.read(inputsPath, DataFrame)
+    return names(inputRaw)
+end
+
 
 function getInputNames(inputsPath; useBg=true)
     inputRaw = CSV.read(inputsPath, DataFrame)
@@ -85,8 +116,10 @@ function processMissingValues(outputRaw)
     return trimmedRange
 end
 
-
-# function to read and process outputs
+"""
+Function to read and process shifted / unshifted outputs. For background solar
+wind runs, only works with unshifted runs.
+"""
 function processOutputs(outputPath, retainedRunIdx; QoI="Ur", useShifted=false)
     if useShifted
         outputRaw = readdlm(joinpath(outputPath, QoI * "SimTrimmed.txt"))
@@ -101,6 +134,7 @@ function processOutputs(outputPath, retainedRunIdx; QoI="Ur", useShifted=false)
 
     return Array{Float64, 2}(Y')
 end
+
 
 # function to build multivariate basis for PCE
 function buildMultivariateBasis(D, P)
@@ -127,6 +161,15 @@ end
 # function to regress PCE
 function solvePCE(A, y; regularize=false)
     β = A \ y
+    return β
+end
+
+"""
+Function to solve regularized linear system for PCE. By default, regularization parameter
+λ is 0 i.e. it performs OLS.
+"""
+function solveRegPCE(A, y; λ = 0)
+    β = (A'A + λ * I) \ (A' * y)
     return β
 end
 
@@ -253,8 +296,12 @@ Process time to enable plotting of time information on graph.
 Problematic: Trim index information. Need to reorganize data so it is 
 easier to deal with.
 """
-function processTimeInfo(timeData, trimIndices = (39, 141))
-    obsTimes = DateTime.(chomp.(timeData))
+function processTimeInfo(timeData; trimIndices = (39, 141))
+    if timeData isa Vector{String}
+        obsTimes = DateTime.(chomp.(timeData))
+    else 
+        obsTimes = DateTime.(timeData)
+    end
     startTime = obsTimes[1]
     obsTimesTrimmed = obsTimes[trimIndices[1]: trimIndices[2]]
     return startTime, obsTimesTrimmed
@@ -262,31 +309,42 @@ end
 
 function plotMainEffects(mainEffects, timeData, inputNames;
                         palette=palette(:tab10, rev=true),
+                        trimIndices=(1, 720),
+                        tickStep=72,
+                        tickFormat="dd-u",
                         title="Title",
+                        lineWidth=0.0,
+                        barWidth=2,
+                        dpi=1000
                         )
     # we will first permute these so they show up with correct convention in 
     # our bar plot
 
     # only columns are reversed after transpose, we are not changing the time series.
     mainEffectsReversed = reverse(mainEffects', dims=2)
-    startTime, obsTimesTrimmed = processTimeInfo(timeData)
-    obsTimeTicks = range(obsTimesTrimmed[1], obsTimesTrimmed[end], step=Hour(12))
+    startTime, obsTimesTrimmed = processTimeInfo(timeData; trimIndices=trimIndices)
+    obsTimeTicks = range(obsTimesTrimmed[1], 
+                        obsTimesTrimmed[end], 
+                        step=Hour(tickStep)
+                        )
     xTicks = findall(in(obsTimeTicks), obsTimesTrimmed)
-    labels = Dates.format.(obsTimeTicks, "dd-m HH:MM")
+    labels = Dates.format.(obsTimeTicks, tickFormat)
     groupedbar(
-            # obsTimesTrimmed,
             mainEffectsReversed,
             bar_position=:stack,
-            # bar_width=2,
+            bar_width=barWidth,
             legend=:outertopright,
             label=permutedims(reverse(inputNames)),
             xticks=(xTicks, labels),
             xminorticks=12,
             figsize=(1000, 600),
             color=[palette[i] for i in 1:size(mainEffectsReversed, 2)]',
-            line=(0.0, :black),
+            line=(lineWidth, :black),
             title=title,
-            ylims=(0, 1)
+            xlims=(1, length(obsTimesTrimmed)),
+            ylims=(0, 1),
+            dpi=dpi,
+            framestyle=:box,
             )
     # plot!(xticks=(ticks, labels))
     plot!(xlabel = "Start Time: $(Dates.format(startTime, "dd-u-yy HH:MM:SS"))")
@@ -294,19 +352,25 @@ function plotMainEffects(mainEffects, timeData, inputNames;
 
 end
 
+
+
+
 """
 Replicate Python function. Plot ONLY one half of the Matrix
 and include text labels to annotate.
 """
 function plotInteractionEffects(gsaIndices, 
                             timeData,
-                            inputNames; 
+                            inputNames;
+                            trimIndices=(1, 720), 
                             timeIdx=nothing,
+                            dpi=1000,
+                            color=:viridis
                             # summaryPlot="mean"
                             )
     if !isnothing(timeIdx)
         interactions = LowerTriangular(gsaIndices[:, :, timeIdx])
-        _, obsTimes = processTimeInfo(timeData)
+        _, obsTimes = processTimeInfo(timeData; trimIndices=trimIndices)
         plotTime = obsTimes[timeIdx]
         plotTitle = "Time:  $(Dates.format(plotTime, "dd-u-yy HH:MM:SS"))"
     else
@@ -327,12 +391,17 @@ function plotInteractionEffects(gsaIndices,
                               inputNames,
                               interactions,
                               yflip=true,
-                              c=:viridis,
+                              c=color,
                               xrot=20,
-                              fillalpha=0.7
-                            #   c=:Blues
+                              fillalpha=0.7,
+                              grid=false,
+                              framestyle=:box,
+                              dpi=dpi
                             )
 
+    
+
+    
     # # 
     # return interactionPlot
     return interactionPlot
@@ -380,7 +449,7 @@ function bootstrapGSA(X, Y;
 
     for replication in 1:NReplications
         for (iSample, n) in enumerate(samplingRange)
-            println("New sample size: ", n)
+            # println("New sample size: ", n)
             sampleIndex = sample(1:size(X, 1), n, replace=replace)
             ASamples = A[sampleIndex, :]
             YSamples = Y[sampleIndex, :]
@@ -398,8 +467,91 @@ function bootstrapGSA(X, Y;
     # return meanEffects, stdEffects
 end
 
+"""
+Function to obtain summary of bootstrap procedure results.
+"""
 function getBootstrapSummary(bootstrapEffects)
+    # note specifying the dimension needs knowledge of which index encodes replications!. Not robust!!
     meanEffects = mean(mainEffectsBootstrap; dims=3)[:, :, 1, :]; # take mean across replications and squeeze out singleton dimension
     stdEffects = std(mainEffectsBootstrap; dims=3)[:, :, 1, :]; 
     return meanEffects, stdEffects
 end
+
+## SECTION TO TEST AND PLOT PREDICTIONS OF SURROGATE
+
+"""
+Take in input matrix X and output matrix Y and split it in suitable fashion into train and test sets.
+The `ratio` parameter specifies sizes i.e. test size / train size ~ 0.2
+"""
+function train_test_split(X, Y; ratio=0.2, seed=20220405)
+    # Random.seed!(seed)
+    shuffledIdx = shuffle(1:size(X, 1))
+    # perform splitting
+    testLength = floor(Int, ratio * length(runs_to_keep))
+    testIdx = shuffledIdx[1:testLength]
+    trainIdx = shuffledIdx[(testLength + 1):end]
+
+    XTrain = X[trainIdx, :]
+    XTest  = X[testIdx,  :]
+    
+    YTrain = Y[trainIdx, :]
+    YTest  = Y[testIdx, :]
+
+    return XTrain, YTrain, XTest, YTest, trainIdx, testIdx
+end
+
+"""
+Function to do L2 fit and return predictions as well as original 
+simulation runs.
+"""
+function regularized_fit(X, Y, lambda;
+                                ratio=0.2,
+                                seed=20220405,
+                                pceDegree=2
+                                )
+    
+    XTrain, YTrain, XTest, YTest, trainIdx, testIdx = train_test_split(X, Y;
+                                                            ratio=ratio,
+                                                            seed=seed
+                                                            )
+    ATrain  = buildCoefficientMatrix(XTrain; pceDegree=pceDegree)
+    ATest   = buildCoefficientMatrix(XTest; pceDegree=pceDegree)
+    βTrain  = solveRegPCE(ATrain, YTrain; λ = lambda)
+    YPred   = ATest * βTrain
+
+    return XTest, YTest, YPred, testIdx
+end
+
+"""
+Extend regularized fit to use supplied XTrain, XTest, etc
+"""
+function regularized_fit(XTrain, YTrain, XTest, lambda;
+                        pceDegree=2)
+    ATrain  = buildCoefficientMatrix(XTrain; pceDegree=pceDegree)
+    ATest   = buildCoefficientMatrix(XTest; pceDegree=pceDegree)
+    βTrain  = solveRegPCE(ATrain, YTrain; λ = lambda)
+    YPred   = ATest * βTrain
+
+    return YPred
+end
+
+"""
+Function to make plots for all test runs across different lambda values.
+"""
+function regularized_plot(YTest, YPred, testIdx, plotIdx, lambda)
+    pReg = plot(YTest[plotIdx, :], line=(:red, 2), label="Truth")
+    plot!(YPred[plotIdx, :], line=(:blue, 2), label="Prediction")
+    plot!(ylims=(200, 900))
+    rmse = sqrt(mean((YTest[plotIdx, :] - YPred[plotIdx, :]).^2))
+    plot!(title = "RMSE:$(round(rmse, digits=2)) " * " λ:$(lambda)  Idx:$(testIdx[plotIdx])")
+    plot!(titlefontsize=6)
+    plot!(legendfontsize=4, fg_legend=false)
+    return pReg, rmse
+end
+
+"""
+Function to plot confidence intervals based on constructed PCE!
+"""
+
+
+
